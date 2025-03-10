@@ -17,8 +17,42 @@ import tempfile
 import io
 from pydub import AudioSegment
 from pydub.playback import play as pydub_play
+import queue
+import json  # for conversation history storage
 
-# Initialize Flask app
+# ----- Conversation History Setup -----
+CONVERSATION_HISTORY_FILE = "conversation_history.json"
+# Overwrite conversation history file on server start
+with open(CONVERSATION_HISTORY_FILE, "w", encoding="utf-8") as f:
+    json.dump([], f, ensure_ascii=False, indent=4)
+
+# Initialize conversation history variables
+conversation_history = []
+history_lock = threading.Lock()
+MAX_HISTORY_LENGTH = 5  # Keep last 5 exchanges (10 messages)
+
+def save_conversation_history():
+    """Save the current conversation history to a JSON file."""
+    with open(CONVERSATION_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(conversation_history, f, ensure_ascii=False, indent=4)
+
+def update_conversation_history(user_message, assistant_response):
+    """Update conversation history and store it locally."""
+    global conversation_history
+    with history_lock:
+        conversation_history.append({
+            "role": "user",
+            "content": user_message
+        })
+        conversation_history.append({
+            "role": "assistant",
+            "content": assistant_response
+        })
+        if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
+            conversation_history = conversation_history[-MAX_HISTORY_LENGTH * 2:]
+        save_conversation_history()
+
+# ----- Flask App Initialization -----
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -26,51 +60,49 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Load environment variables
 load_dotenv()
 
-system_prompt = """
-آپ کو گندم کے کاشتکاروں کے لیے اہم پیغامات فراہم کرنے ہیں۔ ان پیغامات میں گندم کی کاشت، پانی دینے کے اوقات، بیج کی اقسام، جڑی بوٹیوں کا کنٹرول، بیماریوں سے بچاؤ، اور دیگر زرعی مشورے شامل ہیں۔ یہ پیغامات مختلف وقتوں، حالات اور جغرافیائی مقامات کے لیے مخصوص ہیں اور کسانوں کو گندم کی بہتر پیداوار کے لیے رہنمائی فراہم کرتے ہیں۔
+# ----- System Prompt with Conversation History -----
+system_prompt = f"""
+You are an AI assistant designed to provide crucial agricultural guidance to wheat farmers. Your responses must be in Urdu, concise, and focused on wheat cultivation practices, including sowing times, irrigation schedules, seed varieties, weed control, disease prevention, and other farming advice. Tailor your responses to specific seasons, conditions, and geographical contexts to help farmers optimize wheat yields.
 
-گندم کی کاشت کا موزوں وقت یکم سے 15 نومبر ہے۔
-15 نومبر تک بوائی کے لیے بیج کی مقدار 50 کلوگرام فی ایکڑ رکھیں، بعد میں 60 کلوگرام فی ایکڑ۔
-بروقت کاشت کے لیے کپاس، مکئی، اور کماد کے کھیتوں میں پانی بند کرنے کے بعد روٹا ویٹر اور دوہرا ہل چلا کر گندم کی بوائی کریں۔
-بیج کی اقسام کی سفارشیں: بارانی علاقوں میں جی اے 2002، عقاب 2000، این اے ار سی 2009، اور آبپاش علاقوں میں عقاب 2000، پنجند 1 وغیرہ۔
-زمین کی تیاری کے لیے ہل چلانے کی تعداد: وریال زمینوں میں چار پانچ دفعہ اور بھاری زمین میں دو بار ہل چلائیں۔
-بیج کو گریڈ کروا کر اور زہر لگانے کے بعد کاشت کریں۔
-پہلی آبپاشی کے بعد 2ہریرو چلائیں، اور بارانی علاقوں میں بارش کی صورت میں پانی ذخیرہ کرنے کے لیے گہرا ہل چلائیں۔
-فصل پر سست تیلے کے حملے کے لیے پودوں کا معائنہ کریں اور متاثرہ حصوں میں تیلے کو کنٹرول کریں۔
-جڑی بوٹیوں کا کنٹرول: دھند، تیز ہوا، اور بارش میں سپرے نہ کریں، اور سپرے کے لیے فلیٹ فین نوزل کا استعمال کریں۔
-گندم کی فصل کی کٹائی موسمی حالات کو مدنظر رکھتے ہوئے کریں اور کٹائی کے وقت موسمی پیشگوئی پر توجہ دیں۔
+### Key Guidelines:
+- **Sowing Time**: 1st to 15th November is optimal for wheat cultivation.  
+- **Seed Quantity**: Use 50 kg/acre if sown by 15th November; increase to 60 kg/acre afterward.  
+- **Land Preparation**: Use rotavators and double ploughing after clearing cotton, maize, or sugarcane fields.  
+- **Seed Varieties**: Recommend GA 2002, Aqab 2000, NARC 2009 for rainfed areas; Aqab 2000, Punjab-1 for irrigated zones.  
+- **Irrigation**: Perform "Herrio" twice after the first watering. In rainfed areas, deep ploughing helps retain rainwater.  
+- **Pest Control**: Monitor for aphid attacks and use approved insecticides. Avoid spraying during fog, wind, or rain.  
+- **Weed Management**: Use flat-fan nozzles for herbicide application.  
 
----
-User Query (Example):
-مجھے یہ بتاؤ کہ گندم میں کیڑے مارنے کے لیے کون سی زہر یوز کرنی چاہیے۔
+### Example Interaction:
+**User Query (Urdu)**:  
+"مجھے یہ بتاؤ کہ گندم میں کیڑے مارنے کے لیے کون سی زہر یوز کرنی چاہیے۔"  
 
-Response Structure:
-جب صارف اس موضوع پر سوال کرے گا، آپ کو اس کو گندم کی فصل میں کیڑے مار دواؤں کے بارے میں معلومات فراہم کرنی ہیں۔ اس میں مختلف کیڑے مار دواؤں کی قسمیں شامل ہوں گی جو گندم کی فصل کو مختلف کیڑوں سے بچانے میں مدد کرتی ہیں۔
+**Your Response (Urdu)**:  
+**گندم کے کیڑوں کے لیے سفارش کردہ زہر**:  
+- **ایندوسلفن**: وسیع الطیف زہر، سست تیلے اور مکڑیوں کے خلاف مؤثر۔  
+- **سیالوٹرن**: سست تیلے کے لیے بہترین۔  
+- **ایمیٹاف**: تیزی سے اثر کرنے والا۔  
+**ہدایات**: زہر کا استعمال ہدایت کے مطابق کریں۔ سپرے سے پہلے موسم کی پیشگوئی ضرور چیک کریں۔  
 
-### Suggested Insecticides for Wheat:
-ایندوسلفن: یہ ایک وسیع الطیف کیڑے مار دوائی ہے جو مختلف قسم کے کیڑوں کے خلاف موثر ہے، بشمول سست تیلے، مکڑی، اور دوسرے افات کیڑے۔
-سیالوٹرن: یہ دوائی بھی مختلف قسم کے کیڑوں کے خلاف موثر ہے، خاص طور پر سست تیلے اور دوسرے افات کیڑوں کے لیے۔
-ایمیٹاف: یہ دوائی خاص طور پر سست تیلے اور دوسرے افات کیڑوں کے لیے موثر ہے۔
-ٹیوفنوٹ: یہ دوائی بھی سست تیلے اور دوسرے افات کیڑوں کے خلاف موثر ہے۔
-ڈائی فلورین: یہ دوائی مختلف قسم کے کیڑوں کے خلاف موثر ہے، بشمول سست تیلے، مکڑی، اور دوسرے افات کیڑے۔
-### Important Notes:
-کیڑے مار دواؤں کا استعمال صرف ضرورت کے مطابق کیا جائے۔
-کسی بھی کیڑے مار دوائی کا استعمال کرنے سے پہلے اس کی مقدار اور طریقہ کار کو اچھی طرح سے سمجھیں۔
-فصلوں پر کیڑوں کا حملہ ہونے پر فوری اقدامات کریں تاکہ فصل کی پیداوار پر منفی اثر نہ پڑے۔
----
-یہ معلومات کسانوں کو گندم کی فصل کے کیڑوں سے بچاؤ کے لیے مفید رہنمائی فراہم کرے گی۔
-#Your responses should be very short,concise and to the point and make sure you are a helpful AI assistant who guides about agriculture to the farmers.
+### Rules:
+1. **Urdu Responses Only**: All answers must be in Urdu, using simple language for farmers.  
+2. **Conciseness**: Keep responses under 4-5 lines unless details are critical.  
+3. **Topic Enforcement**: Politely redirect users to agriculture-related queries if they deviate.  
+4. **Urgent Issues**: Prioritize warnings (e.g., pest outbreaks, weather risks) in bold.
+
+Historical conversation context:
+{conversation_history}
 """
 
-# Initialize clients
+# ----- API Clients Initialization -----
 try:
-    tts_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY", "sk_5207215d199ad1a8e2bafedd6affda66b16cf53f472f02dc"))
+    tts_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY", "sk_47693bddc28209f1fddc944af4898cae6ffd4f14800c7525"))
     client = Groq(api_key=os.getenv("GROQ_API_KEY", "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"))
     print("API clients initialized successfully")
 except Exception as e:
     print(f"Error initializing API clients: {e}")
 
-# Load Silero VAD model and utility functions
+# ----- VAD and Whisper Initialization -----
 try:
     vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=True)
     (get_speech_timestamps, _, _, _, _) = utils
@@ -80,10 +112,8 @@ except Exception as e:
     vad_model = None
     utils = None
 
-# Initialize Whisper model
 try:
     model_size = "large-v3-turbo"
-    # Check if CUDA is available, otherwise use CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
     whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
@@ -92,21 +122,23 @@ except Exception as e:
     print(f"Error loading Whisper model: {e}")
     whisper_model = None
 
-# Audio recording parameters
+# ----- Audio Recording Parameters and Globals -----
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 CHUNK = 512
 
-# Global variables
-is_listening = False
+audio_queue = queue.Queue(maxsize=10)  # Queue for audio segments
 audio_buffer = []
 last_voice_time = time.time()
 silence_threshold = 2.0
+
 audio_interface = None
 stream = None
-is_processing = False  # Flag to indicate if we're processing audio or playing response
-processing_lock = threading.Lock()  # Lock to synchronize access to processing state
+
+# Worker thread flag and mic state flag
+is_listening = False
+is_speaking = False  # Used to block mic input during TTS playback
 
 def initialize_audio():
     global audio_interface, stream
@@ -135,73 +167,70 @@ def cleanup_audio():
     print("Audio resources cleaned up")
 
 def process_audio_data(data):
-    global last_voice_time, audio_buffer, is_processing
-    
-    # If we're currently processing audio or playing a response, don't process new audio
-    if is_processing:
-        return False
-    
+    """
+    Process the raw audio data with VAD.
+    Append data to the audio_buffer if speech is detected.
+    Return True when a full segment (i.e. silence following speech) is ready.
+    """
+    global last_voice_time, audio_buffer
+
     try:
         audio_data = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
         audio_tensor = torch.from_numpy(audio_data).unsqueeze(0)
-        
+
         speech_prob = vad_model(audio_tensor, sr=RATE).mean().item()
         socketio.emit('speech_probability', {'probability': speech_prob})
-        
+
         if speech_prob > 0.5:
             last_voice_time = time.time()
             audio_buffer.append(data)
-            return False  # Not done processing
+            return False  # Continue accumulating
         else:
             if audio_buffer and (time.time() - last_voice_time) > silence_threshold:
-                return True  # Done processing, silence detected
-            return False  # Not done processing
+                return True  # Silence detected; segment complete
+            return False  # Still in silence, but no segment to process yet
     except Exception as e:
         print(f"Error processing audio data: {e}")
         return False
 
-def transcribe_audio():
-    global audio_buffer
-    
-    if not audio_buffer:
-        return None
-    
+def transcribe_audio(audio_segment_data):
+    """
+    Transcribe audio from a given audio segment.
+    """
     try:
-        recorded_audio = b"".join(audio_buffer)
-        
-        # Create a temporary file
+        # Write the audio segment to a temporary WAV file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             filename = temp_file.name
-        
-        # Write audio data to the temporary file
+
         with wave.open(filename, "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(audio_interface.get_sample_size(FORMAT))
             wf.setframerate(RATE)
-            wf.writeframes(recorded_audio)
-        
-        # Transcribe the audio
+            wf.writeframes(audio_segment_data)
+
         segments, info = whisper_model.transcribe(filename, beam_size=5, language="ur")
         print(f"Detected language '{info.language}' with probability {info.language_probability}")
-        
+
         transcribed_text = " ".join([segment.text for segment in segments])
         print(f"Transcribed Text: {transcribed_text}")
-        
-        # Clean up the temporary file
+
         os.unlink(filename)
-        
         return transcribed_text
     except Exception as e:
         print(f"Error transcribing audio: {e}")
         return None
 
 def get_ai_response(text):
+    """
+    Get AI response using conversation history.
+    The system prompt (which includes historical context) is sent along with the user message.
+    """
     try:
+        with history_lock:
+            history = conversation_history.copy()
+        messages = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": text}]
         chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
+            messages=messages,
             model="llama-3.3-70b-versatile",
             temperature=0.3,
             max_tokens=500,
@@ -211,142 +240,114 @@ def get_ai_response(text):
         )
         response_text = chat_completion.choices[0].message.content
         print(f"Groq Response: {response_text}")
+        update_conversation_history(text, response_text)
         return response_text
     except Exception as e:
         print(f"Error getting AI response: {e}")
         return "Sorry, I couldn't process your request."
 
 def play_audio_response(text):
-    global is_processing
-    
+    """
+    Play the audio response and block mic input during playback.
+    """
+    global is_speaking
     try:
+        # Block mic input before starting playback
+        is_speaking = True
+        socketio.emit('mic_toggle_enabled', {'enabled': False})
         socketio.emit('audio_playing')
         
-        # Get audio bytes from ElevenLabs
         audio_response = tts_client.text_to_speech.convert(
             text=text,
-            voice_id="JBFqnCBsd6RMkjVDRZzb",
+            voice_id="Sxk6njaoa7XLsAFT7WcN",
             model_id="eleven_multilingual_v2",
             output_format="mp3_44100_128",
         )
+        audio_bytes = b''.join(chunk for chunk in audio_response)
         
-        # Convert the generator to bytes
-        audio_bytes = b''
-        for chunk in audio_response:
-            audio_bytes += chunk
-        
-        # Save audio to a temporary file
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
             temp_file.write(audio_bytes)
             filename = temp_file.name
         
-        # Play the audio using pydub
         sound = AudioSegment.from_mp3(filename)
         pydub_play(sound)
         
-        # Clean up the temporary file
         os.unlink(filename)
-        
     except Exception as e:
         print(f"Error playing audio response: {e}")
     finally:
-        # Signal that we're done playing audio
+        # Re-enable mic input after playback
+        is_speaking = False
+        socketio.emit('mic_toggle_enabled', {'enabled': True})
         socketio.emit('audio_ended')
-        
-        # Reset processing flag to allow new audio input
-        with processing_lock:
-            is_processing = False
-            print("Processing completed, ready for new input")
 
-def process_voice_input():
-    global is_processing, audio_buffer
-    
-    # Set processing flag to prevent new audio input
-    with processing_lock:
-        is_processing = True
-        print("Starting audio processing, pausing voice detection")
-    
+def process_voice_input(audio_segment):
+    """
+    Process a single complete audio segment:
+    transcribe, get AI response, and play the response.
+    """
     try:
-        # Transcribe the audio
-        transcribed_text = transcribe_audio()
-        
+        transcribed_text = transcribe_audio(audio_segment)
         if transcribed_text and transcribed_text.strip():
             socketio.emit('transcribed_text', {'text': transcribed_text})
-            
-            # Get AI response
             response_text = get_ai_response(transcribed_text)
             socketio.emit('response', {'text': response_text})
-            
-            # Play audio response
             play_audio_response(response_text)
         else:
-            # If no valid transcription, reset processing flag
-            with processing_lock:
-                is_processing = False
-                print("No valid transcription, resuming voice detection")
-        
-        # Clear the buffer
-        audio_buffer = []
+            print("No valid transcription; skipping processing for this segment.")
     except Exception as e:
-        print(f"Error in process_voice_input: {e}")
-        # Reset processing flag in case of error
-        with processing_lock:
-            is_processing = False
-            print("Error in processing, resuming voice detection")
+        print(f"Error processing voice input: {e}")
+
+def audio_processing_worker():
+    """
+    Worker thread that processes audio segments from the queue.
+    """
+    while True:
+        audio_segment = audio_queue.get()  # This blocks until an item is available
+        if audio_segment is None:
+            break  # Use None as a sentinel to shut down the worker
+        process_voice_input(audio_segment)
+        audio_queue.task_done()
 
 def listening_thread_function():
-    global is_listening, audio_buffer, is_processing
-    
+    """
+    Continuously capture audio, run VAD, and enqueue complete audio segments.
+    """
+    global is_listening, audio_buffer
     print("Listening thread started")
-    
     while is_listening:
         try:
-            if stream and not is_processing:  # Only process audio if not already processing
+            if stream:
                 data = stream.read(CHUNK, exception_on_overflow=False)
-                
                 if process_audio_data(data):
-                    print("Silence detected. Processing recorded audio...")
+                    print("Silence detected. Enqueuing recorded audio segment...")
+                    recorded_audio = b"".join(audio_buffer)
                     
-                    # Process voice input in a separate thread
-                    threading.Thread(target=process_voice_input).start()
-            
+                    if not audio_queue.full():
+                        audio_queue.put(recorded_audio)
+                    else:
+                        print("Audio queue full. Dropping segment.")
+                    
+                    audio_buffer = []
             time.sleep(0.01)
         except Exception as e:
             print(f"Error in listening thread: {e}")
-    
     print("Listening thread stopped")
 
+# ----- Flask Endpoints and SocketIO Events -----
 @app.route('/process_text', methods=['POST'])
 def process_text():
-    global is_processing
-    
     try:
-        # Set processing flag to prevent new audio input
-        with processing_lock:
-            is_processing = True
-            print("Starting text processing, pausing voice detection")
-        
         data = request.json
         text = data.get('text', '')
-        
         if not text:
-            # Reset processing flag if no text
-            with processing_lock:
-                is_processing = False
             return jsonify({'error': 'No text provided'}), 400
-        
-        # Get AI response
+
         response_text = get_ai_response(text)
-        
-        # Play audio response in a separate thread
         threading.Thread(target=play_audio_response, args=(response_text,)).start()
-        
         return jsonify({'response': response_text})
     except Exception as e:
         print(f"Error processing text: {e}")
-        # Reset processing flag in case of error
-        with processing_lock:
-            is_processing = False
         return jsonify({'error': str(e)}), 500
 
 @socketio.on('connect')
@@ -359,56 +360,39 @@ def handle_disconnect():
 
 @socketio.on('start_listening')
 def handle_start_listening():
-    global is_listening, audio_buffer, is_processing
-    
+    global is_listening, audio_buffer
     if is_listening:
         return
-    
+
     print("Starting listening...")
-    
-    # Initialize audio if not already done
     if not audio_interface or not stream:
         if not initialize_audio():
             socketio.emit('error', {'message': 'Failed to initialize audio'})
             return
-    
-    # Clear the buffer
+
     audio_buffer = []
-    
-    # Reset processing flag
-    with processing_lock:
-        is_processing = False
-    
-    # Start listening
     is_listening = True
-    
-    # Start the listening thread
     threading.Thread(target=listening_thread_function).start()
 
 @socketio.on('stop_listening')
 def handle_stop_listening():
     global is_listening
-    
     if not is_listening:
         return
-    
     print("Stopping listening...")
-    
-    # Stop listening
     is_listening = False
 
-# Add a new event to check if system is ready for input
 @socketio.on('check_ready')
 def handle_check_ready():
-    global is_processing
-    socketio.emit('system_ready', {'ready': not is_processing})
+    socketio.emit('system_ready', {'ready': True})
 
 if __name__ == '__main__':
     try:
-        # Initialize audio
         initialize_audio()
-        
-        # Start the server
+        # Start the audio processing worker thread
+        worker_thread = threading.Thread(target=audio_processing_worker, daemon=True)
+        worker_thread.start()
+
         print("Starting server on http://localhost:5000")
         socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
     except KeyboardInterrupt:
@@ -416,5 +400,6 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error starting server: {e}")
     finally:
-        # Clean up resources
+        # Signal the worker thread to exit and clean up
+        audio_queue.put(None)
         cleanup_audio()
