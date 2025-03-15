@@ -36,131 +36,98 @@ function App() {
       setConnectionStatus('connected');
       addLog('Connected to server');
     });
-
+  
     socket.on('disconnect', () => {
       setConnectionStatus('disconnected');
       addLog('Disconnected from server');
     });
-
+  
     socket.on('speech_probability', (data) => {
-      if (!isMicBlocked) {
-        setSpeechProbability(data.probability);
-        addLog(`Speech probability: ${(data.probability * 100).toFixed(2)}%`);
-      }
+      setSpeechProbability(data.probability);
+      addLog(`Speech probability: ${(data.probability * 100).toFixed(2)}%`);
     });
-
+  
+    // Block mic when processing starts
     socket.on('start_processing', () => {
       setIsMicBlocked(true);
-      setSystemReady(false);
-      addLog('Mic blocked: Processing started');
+      addLog('Mic input blocked: Processing started');
     });
-
+  
     socket.on('transcribed_text', (data) => {
       setTranscribedText(data.text);
       addLog(`Transcribed Text: ${data.text}`);
-    });
-
-    socket.on('audio_playing', () => {
-      setIsMicBlocked(true);
       setSystemReady(false);
-      addLog('Mic blocked: Audio playback started');
     });
-
+  
     socket.on('response', async (data) => {
       setResponseText(data.text);
-      addLog(`Response received: ${data.text}`);
+      addLog(`Response: ${data.text}`);
       setConversationHistory((prev) => [
         ...prev,
         { question: transcribedText, answer: data.text },
       ]);
-
-      if (data.audio) {
-        try {
-          addLog('Decoding audio response');
-          playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: 44100,
-          });
-          const audioBuffer = await playbackContextRef.current.decodeAudioData(data.audio.slice(0));
-          const source = playbackContextRef.current.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(playbackContextRef.current.destination);
-          source.onended = () => {
-            addLog('Audio playback ended naturally');
-            cleanupPlayback();
-            // Ensure mic resumes immediately
-            if (isListening) {
-              addLog('Resuming mic input post-playback');
-              socket.emit('check_ready'); // Trigger backend readiness check
-            }
-          };
-          addLog('Starting audio playback');
-          source.start(0);
-
-          setTimeout(() => {
-            if (isMicBlocked) {
-              addLog('Audio playback timeout after 20s, forcing reset');
-              source.stop();
-              cleanupPlayback();
-            }
-          }, 20000);
-        } catch (error) {
-          addLog(`Error playing audio: ${error.message}`);
-          cleanupPlayback();
-        }
-      } else {
-        addLog('No audio data in response');
-        cleanupPlayback();
+  
+      try {
+        addLog('Playing audio response');
+        playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: 44100,
+        });
+        const audioBuffer = await playbackContextRef.current.decodeAudioData(data.audio);
+        const source = playbackContextRef.current.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(playbackContextRef.current.destination);
+        source.onended = () => {
+          setIsMicBlocked(false); // Unblock mic after playback ends
+          setSystemReady(true);
+          addLog('Audio playback ended, mic input unblocked');
+          socket.emit('check_ready');
+          playbackContextRef.current.close();
+        };
+        source.start(0);
+      } catch (error) {
+        addLog(`Error playing audio: ${error.message}`);
+        setIsMicBlocked(false);
+        setSystemReady(true);
       }
     });
-
+  
     socket.on('system_ready', (data) => {
       setSystemReady(data.ready);
       addLog(`System ready: ${data.ready}`);
-      if (data.ready && isListening && !isMicBlocked) {
-        addLog('System confirmed ready, mic active');
-      }
     });
-
+  
     socket.on('error', (data) => {
       addLog(`Server error: ${data.message}`);
-      cleanupPlayback();
     });
-
-    const cleanupPlayback = () => {
-      if (playbackContextRef.current) {
-        playbackContextRef.current.close().catch(e => addLog(`Error closing playback context: ${e.message}`));
-        playbackContextRef.current = null;
-      }
-      setIsMicBlocked(false);
-      setSystemReady(true);
-      socket.emit('audio_ended');
-      addLog('Playback cleaned up, mic unblocked');
-    };
-
+  
     return () => {
       socket.off('connect');
       socket.off('disconnect');
       socket.off('speech_probability');
       socket.off('start_processing');
       socket.off('transcribed_text');
-      socket.off('audio_playing');
       socket.off('response');
       socket.off('system_ready');
       socket.off('error');
-      if (playbackContextRef.current) {
-        playbackContextRef.current.close();
-      }
     };
-  }, [transcribedText, isListening]);
+  }, [transcribedText]);
 
-  // Ensure toggleListening keeps mic active unless manually stopped
+  useEffect(() => {
+    const readyCheckInterval = setInterval(() => {
+      if (connectionStatus === 'connected' && !isMicBlocked) {
+        socket.emit('check_ready');
+      }
+    }, 2000);
+    return () => clearInterval(readyCheckInterval);
+  }, [connectionStatus, isMicBlocked]);
+
   const toggleListening = async () => {
     if (connectionStatus === 'disconnected') {
       addLog('Cannot start listening: Not connected to server');
       return;
     }
-    if (!systemReady || isMicBlocked) {
-      addLog('System is processing or playing. Please wait.');
+    if (!systemReady) {
+      addLog('System is currently processing or playing. Please wait.');
       return;
     }
 
@@ -224,7 +191,7 @@ function App() {
   };
 
   const testWithSample = () => {
-    if (!systemReady || isMicBlocked) {
+    if (!systemReady) {
       addLog('System is processing or playing - sample test blocked');
       return;
     }
@@ -232,8 +199,8 @@ function App() {
       'مجھے یہ بتاؤ کہ گندم میں کیڑے مارنے کے لیے کون سی زہر یوز کرنی چاہیے۔';
     setTranscribedText(sampleQuestion);
     addLog(`Testing with sample: ${sampleQuestion}`);
-    setIsMicBlocked(true);
     setSystemReady(false);
+    setIsMicBlocked(true);
 
     axios
       .post('http://localhost:5000/process_text', { text: sampleQuestion })
@@ -244,6 +211,8 @@ function App() {
           ...prev,
           { question: sampleQuestion, answer: response.data.response },
         ]);
+        setIsMicBlocked(false);
+        setSystemReady(true);
       })
       .catch((error) => {
         addLog(`Sample test error: ${error.message}`);
@@ -252,7 +221,6 @@ function App() {
       });
   };
 
-  // Rest of the JSX remains unchanged, but ensure mic button reflects blocked state
   return (
     <div className="min-h-screen bg-gradient-to-b from-green-50 to-green-100 flex flex-col">
       <header className="bg-gradient-to-r from-green-700 to-green-600 text-white p-4 shadow-md">
@@ -315,14 +283,14 @@ function App() {
                   <button
                     onClick={toggleListening}
                     className={`p-6 rounded-full ${
-                      !systemReady || isMicBlocked
+                      !systemReady
                         ? 'bg-gray-400 cursor-not-allowed'
                         : isListening
                         ? 'bg-red-500 hover:bg-red-600'
                         : 'bg-green-600 hover:bg-green-700'
                     } text-white transition-all duration-300 shadow-lg hover:shadow-xl transform hover:scale-105`}
                     disabled={
-                      connectionStatus === 'disconnected' || !systemReady || isMicBlocked
+                      connectionStatus === 'disconnected' || !systemReady
                     }
                   >
                     {isListening ? <MicOff size={32} /> : <Mic size={32} />}
@@ -346,13 +314,13 @@ function App() {
 
                 <div className="flex items-center gap-3 text-base text-gray-600">
                   <span>Status:</span>
-                  {!systemReady || isMicBlocked ? (
+                  {!systemReady ? (
                     <span className="text-yellow-500 font-medium flex items-center gap-2">
                       <span className="relative flex h-3 w-3">
                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-yellow-400 opacity-75"></span>
                         <span className="relative inline-flex rounded-full h-3 w-3 bg-yellow-500"></span>
                       </span>
-                      {isMicBlocked ? 'Responding' : 'Processing'}
+                      Processing
                     </span>
                   ) : isListening ? (
                     <span className="text-green-500 font-medium flex items-center gap-2">
@@ -364,6 +332,12 @@ function App() {
                     </span>
                   ) : (
                     <span className="text-gray-600 font-medium">Ready</span>
+                  )}
+                  {isMicBlocked && (
+                    <span className="text-green-600 font-medium flex items-center gap-2 ml-4">
+                      <Volume2 size={18} className="animate-pulse" />
+                      Responding
+                    </span>
                   )}
                 </div>
 
@@ -377,18 +351,17 @@ function App() {
                   <button
                     onClick={testWithSample}
                     className={`px-5 py-2.5 ${
-                      !systemReady || isMicBlocked
+                      !systemReady
                         ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
                         : 'bg-green-100 text-green-800 hover:bg-green-200'
                     } rounded-md border border-green-300 text-base font-medium transition-colors duration-200`}
-                    disabled={!systemReady || isMicBlocked}
+                    disabled={!systemReady}
                   >
                     Test with Sample Question
                   </button>
                 </div>
               </div>
 
-              {/* Rest of the JSX remains unchanged */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
                 <div className="bg-white rounded-lg shadow-lg p-6 border-l-4 border-green-400 transform hover:scale-[1.01] transition-transform duration-300">
                   <h2 className="text-xl font-semibold mb-4 text-green-800 flex items-center">
@@ -470,7 +443,7 @@ function App() {
                           dir="rtl"
                           style={{ lineHeight: '2' }}
                         >
-                          {item.question}
+                          {item.question} {/* Fixed typo */}
                         </div>
                       </div>
                       <div>
@@ -566,3 +539,308 @@ function App() {
 }
 
 export default App;
+import time
+import numpy as np
+import torch
+from faster_whisper import WhisperModel
+from groq import Groq
+from dotenv import load_dotenv
+from elevenlabs.client import ElevenLabs
+import os
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO
+from flask_cors import CORS
+import threading
+import tempfile
+import io
+import queue
+import wave
+
+app = Flask(__name__)
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+load_dotenv()
+
+system_prompt = """
+You are an AI assistant designed to provide crucial agricultural guidance to wheat farmers. Your responses must be in Urdu, concise, and focused on wheat cultivation practices, including sowing times, irrigation schedules, seed varieties, weed control, disease prevention, and other farming advice. Tailor your responses to specific seasons, conditions, and geographical contexts to help farmers optimize wheat yields.
+
+### Key Guidelines:
+- **Sowing Time**: 1st to 15th November is optimal for wheat cultivation.  
+- **Seed Quantity**: Use 50 kg/acre if sown by 15th November; increase to 60 kg/acre afterward.  
+- **Land Preparation**: Use rotavators and double ploughing after clearing cotton, maize, or sugarcane fields.  
+- **Seed Varieties**: Recommend GA 2002, Aqab 2000, NARC 2009 for rainfed areas; Aqab 2000, Punjab-1 for irrigated zones.  
+- **Irrigation**: Perform "Herrio" twice after the first watering. In rainfed areas, deep ploughing helps retain rainwater.  
+- **Pest Control**: Monitor for aphid attacks and use approved insecticides. Avoid spraying during fog, wind, or rain.  
+- **Weed Management**: Use flat-fan nozzles for herbicide application.  
+
+### Example Interaction:
+**User Query (Urdu)**:  
+"مجھے یہ بتاؤ کہ گندم میں کیڑے مارنے کے لیے کون سی زہر یوز کرنی چاہیے۔"  
+
+**Your Response (Urdu)**:  
+**گندم کے کیڑوں کے لیے سفارش کردہ زہر**:  
+- **ایندوسلفن**: وسیع الطیف زہر، سست تیلے اور مکڑیوں کے خلاف مؤثر۔  
+- **سیالوٹرن**: سست تیلے کے لیے بہترین۔  
+- **ایمیٹاف**: تیزی سے اثر کرنے والا۔  
+**ہدایات**: زہر کا استعمال ہدایت کے مطابق کریں۔ سپرے سے پہلے موسم کی پیشگوئی ضرور چیک کریں۔  
+
+### Rules:
+1. **Urdu Responses Only**: All answers must be in Urdu, using simple language for farmers.  
+2. **Conciseness**: Keep responses under 4-5 lines unless details are critical.  
+3. **Topic Enforcement**: Politely redirect users to agriculture-related queries if they deviate.  
+4. **Urgent Issues**: Prioritize warnings (e.g., pest outbreaks, weather risks) in bold.  
+"""
+
+try:
+    tts_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY", "sk_47693bddc28209f1fddc944af4898cae6ffd4f14800c7525"))
+    client = Groq(api_key=os.getenv("GROQ_API_KEY", "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"))
+    print("API clients initialized successfully")
+except Exception as e:
+    print(f"Error initializing API clients: {e}")
+
+try:
+    vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=True)
+    (get_speech_timestamps, _, _, _, _) = utils
+    print("VAD model loaded successfully")
+except Exception as e:
+    print(f"Error loading VAD model: {e}")
+    vad_model = None
+    utils = None
+
+try:
+    model_size = "large-v3-turbo"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    print(f"Whisper model loaded successfully on {device}")
+except Exception as e:
+    print(f"Error loading Whisper model: {e}")
+    whisper_model = None
+
+RATE = 16000
+CHANNELS = 1
+VAD_CHUNK_SIZE = 512  # Silero VAD expects 512 samples at 16kHz
+SILENCE_THRESHOLD = 2.0
+SPEECH_THRESHOLD = 0.7  # Increased from 0.5 to reduce sensitivity
+
+audio_queue = queue.Queue(maxsize=10)
+audio_buffer = bytearray()  # Buffer for raw PCM data during speech
+last_voice_time = time.time()
+is_listening = False
+is_speaking = False
+
+def process_audio_data(data):
+    """Process PCM audio chunks for VAD and accumulate buffer when speech is detected."""
+    global last_voice_time, audio_buffer, is_speaking
+    try:
+        audio_np = np.frombuffer(data, dtype=np.float32)
+        audio_int16 = (audio_np * 32767).astype(np.int16)
+        audio_data = audio_int16.tobytes()
+
+        audio_tensor = torch.from_numpy(audio_np).unsqueeze(0)
+        speech_prob = vad_model(audio_tensor, sr=RATE).mean().item()
+        socketio.emit('speech_probability', {'probability': speech_prob})
+        print(f"Speech probability: {speech_prob}")
+
+        if speech_prob > SPEECH_THRESHOLD and not is_speaking:
+            print("Speech started, beginning accumulation")
+            is_speaking = True
+            audio_buffer = bytearray()
+            audio_buffer.extend(audio_data)
+            last_voice_time = time.time()
+        elif speech_prob > SPEECH_THRESHOLD and is_speaking:
+            audio_buffer.extend(audio_data)
+            last_voice_time = time.time()
+        elif speech_prob <= SPEECH_THRESHOLD and is_speaking:
+            audio_buffer.extend(audio_data)
+            if (time.time() - last_voice_time) > SILENCE_THRESHOLD:
+                print(f"Silence detected after speech, buffer size: {len(audio_buffer)} bytes")
+                is_speaking = False
+                # Emit event to block mic before transcription starts
+                socketio.emit('start_processing')
+                return True
+        return False
+    except Exception as e:
+        print(f"Error processing audio chunk for VAD: {e}")
+        if is_speaking:
+            audio_buffer.extend(audio_data)
+            if (time.time() - last_voice_time) > SILENCE_THRESHOLD:
+                print(f"Silence detected (fallback), buffer size: {len(audio_buffer)} bytes")
+                is_speaking = False
+                # Emit event to block mic before transcription starts
+                socketio.emit('start_processing')
+                return True
+        return False
+
+def transcribe_audio(audio_data):
+    """Transcribe audio from accumulated PCM data."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            with wave.open(temp_file.name, 'wb') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(RATE)
+                wf.writeframes(audio_data)
+            wav_filename = temp_file.name
+
+        print(f"Saved PCM data to WAV: {wav_filename}, size: {len(audio_data)} bytes")
+
+        segments, info = whisper_model.transcribe(wav_filename, beam_size=5, language="ur")
+        print(f"Detected language '{info.language}' with probability {info.language_probability}")
+        transcribed_text = " ".join([segment.text for segment in segments])
+        print(f"Transcribed Text: {transcribed_text}")
+
+        os.unlink(wav_filename)
+        return transcribed_text
+    except Exception as e:
+        print(f"Error transcribing audio: {e}")
+        return None
+
+def get_ai_response(text):
+    """Generate AI response using Groq."""
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            max_tokens=500,
+            top_p=0.9,
+            frequency_penalty=0,
+            presence_penalty=0,
+        )
+        response_text = chat_completion.choices[0].message.content
+        print(f"Groq Response: {response_text}")
+        return response_text
+    except Exception as e:
+        print(f"Error getting AI response: {e}")
+        return "معذرت، میں آپ کی درخواست پر عمل نہیں کر سکا۔"
+
+def generate_audio_response(text):
+    """Generate audio from text and return as bytes."""
+    try:
+        audio_response = tts_client.text_to_speech.convert(
+            text=text,
+            voice_id="Sxk6njaoa7XLsAFT7WcN",
+            model_id="eleven_multilingual_v2",
+            output_format="mp3_44100_128",
+        )
+        audio_bytes = b''.join(chunk for chunk in audio_response)
+        print(f"Generated audio response, size: {len(audio_bytes)} bytes")
+        return audio_bytes
+    except Exception as e:
+        print(f"Error generating audio response: {e}")
+        return None
+
+def process_voice_input(audio_segment):
+    """Process a complete audio segment."""
+    try:
+        transcribed_text = transcribe_audio(audio_segment)
+        if transcribed_text and transcribed_text.strip():
+            socketio.emit('transcribed_text', {'text': transcribed_text})
+            response_text = get_ai_response(transcribed_text)
+            audio_data = generate_audio_response(response_text)
+            if audio_data:
+                socketio.emit('response', {'text': response_text, 'audio': audio_data})
+            else:
+                socketio.emit('response', {'text': response_text})
+        else:
+            print("No valid transcription; skipping processing.")
+    except Exception as e:
+        print(f"Error processing voice input: {e}")
+
+def audio_processing_worker():
+    """Worker thread to process audio segments from the queue."""
+    while True:
+        audio_segment = audio_queue.get()
+        if audio_segment is None:
+            break
+        process_voice_input(audio_segment)
+        audio_queue.task_done()
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('start_listening')
+def handle_start_listening():
+    global is_listening, audio_buffer, last_voice_time, is_speaking
+    if is_listening:
+        return
+    print("Starting listening...")
+    audio_buffer = bytearray()
+    last_voice_time = time.time()
+    is_speaking = False
+    is_listening = True
+
+@socketio.on('stop_listening')
+def handle_stop_listening():
+    global is_listening, audio_buffer, is_speaking
+    if not is_listening:
+        return
+    print("Stopping listening...")
+    is_listening = False
+    if audio_buffer and is_speaking:
+        if not audio_queue.full():
+            print(f"Enqueuing buffer on stop: {len(audio_buffer)} bytes")
+            audio_queue.put(bytes(audio_buffer))
+        else:
+            print("Audio queue full. Dropping segment.")
+    audio_buffer = bytearray()
+    is_speaking = False
+
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    global is_listening, audio_buffer
+    audio_data = data['audio']
+    print(f"Received audio chunk of size {len(audio_data)} bytes")
+    if not is_listening:
+        return
+    if process_audio_data(audio_data):
+        print("Silence detected. Enqueuing recorded audio segment...")
+        if not audio_queue.full():
+            print(f"Enqueuing buffer: {len(audio_buffer)} bytes")
+            audio_queue.put(bytes(audio_buffer))
+        else:
+            print("Audio queue full. Dropping segment.")
+        audio_buffer = bytearray()
+
+@socketio.on('check_ready')
+def handle_check_ready():
+    socketio.emit('system_ready', {'ready': True})
+
+@app.route('/process_text', methods=['POST'])
+def process_text():
+    try:
+        data = request.json
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        response_text = get_ai_response(text)
+        audio_data = generate_audio_response(response_text)
+        if audio_data:
+            socketio.emit('response', {'text': response_text, 'audio': audio_data})
+        return jsonify({'response': response_text})
+    except Exception as e:
+        print(f"Error processing text: {e}")
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    try:
+        worker_thread = threading.Thread(target=audio_processing_worker, daemon=True)
+        worker_thread.start()
+        print("Starting server on http://localhost:5000")
+        socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+    except KeyboardInterrupt:
+        print("Server stopped by user")
+    except Exception as e:
+        print(f"Error starting server: {e}")
+    finally:
+        audio_queue.put(None)
